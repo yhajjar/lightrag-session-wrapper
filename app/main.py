@@ -153,9 +153,17 @@ def _build_references(filtered_payload: Dict[str, Any]) -> List[Reference]:
     return references
 
 
-def _compose_answer(chunks: List[Dict[str, Any]]) -> str:
+def _compose_answer(chunks: List[Dict[str, Any]], query_text: str) -> str:
     """Construct a simple response string from filtered chunks."""
+    normalized_query = (query_text or "").strip()
     if not chunks:
+        if normalized_query:
+            display_query = (
+                normalized_query
+                if len(normalized_query) <= 120
+                else f"{normalized_query[:117]}..."
+            )
+            return f"No documents in this session contain information about '{display_query}'."
         return "No session-relevant context found for this query."
 
     parts: List[str] = []
@@ -260,8 +268,16 @@ async def query_session(
     data_section = filtered.get("data") or {}
     chunks = data_section.get("chunks") or []
 
-    response_text = _compose_answer(chunks)
+    response_text = _compose_answer(chunks, query.query)
     references = _build_references(filtered)
+
+    logger.info(
+        "Session %s query='%s' doc_count=%d filtered_chunks=%d",
+        session_id,
+        query.query,
+        len(session.document_ids),
+        len(chunks),
+    )
 
     await session_manager.update_activity(session_id)
     return QueryResponse(
