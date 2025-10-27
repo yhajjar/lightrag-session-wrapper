@@ -17,7 +17,7 @@ class LightRagClient:
         self.base_url = base_url.rstrip("/")
         headers = {"Accept": "application/json"}
         if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
+            headers["X-API-Key"] = api_key
         self._client = httpx.AsyncClient(
             base_url=self.base_url, headers=headers, timeout=timeout
         )
