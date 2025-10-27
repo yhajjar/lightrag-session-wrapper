@@ -44,3 +44,14 @@ async def test_pending_track_resolution():
     assert session is not None
     assert session.document_ids == ["doc-real"]
     assert await manager.get_pending_tracks("session-2") == {}
+
+
+@pytest.mark.asyncio
+async def test_add_file_name_normalizes_and_deduplicates():
+    manager = SessionManager()
+    await manager.create_session("session-files")
+    await manager.add_file_name("session-files", "Reports/Annual.Summary.PDF")
+    await manager.add_file_name("session-files", "annual.summary.pdf")
+
+    file_names = await manager.get_file_names("session-files")
+    assert file_names == ["annual.summary.pdf"]

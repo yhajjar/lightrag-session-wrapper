@@ -23,7 +23,7 @@ def test_filter_by_session_keeps_matching_items():
         },
     }
 
-    filtered = filter_by_session(rag_response, ["doc-xyz789"])
+    filtered = filter_by_session(rag_response, ["doc-xyz789"], ["doc_xyz789_summary.md"])
 
     chunks = filtered["data"]["chunks"]
     entities = filtered["data"]["entities"]
@@ -37,7 +37,7 @@ def test_filter_by_session_keeps_matching_items():
 
 
 def test_filter_by_session_returns_original_when_no_data():
-    result = filter_by_session({}, ["doc-1"])
+    result = filter_by_session({}, ["doc-1"], [])
     assert result == {}
 
 
@@ -53,3 +53,20 @@ def test_filter_allows_partial_source_match():
 
     filtered = filter_by_session(rag_response, ["doc-xyz789"])
     assert filtered["data"]["chunks"][0]["source_id"] == "chunk-doc-xyz789-001"
+
+
+def test_filter_matches_on_file_name_only():
+    rag_response = {
+        "status": "success",
+        "data": {
+            "chunks": [
+                {"content": "Info", "file_path": "/uploads/Report.PDF", "source_id": "chunk-7"}
+            ],
+            "entities": [],
+            "relationships": [],
+            "references": [],
+        },
+    }
+
+    filtered = filter_by_session(rag_response, [], ["report.pdf"])
+    assert len(filtered["data"]["chunks"]) == 1

@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
 from .models import SessionData
+from .utils import normalize_file_name
 
 
 def utcnow() -> datetime:
@@ -31,7 +32,7 @@ class SessionManager:
                     document_ids=[],
                     created_at=now,
                     last_activity=now,
-                    metadata={"document_count": 0},
+                    metadata={"document_count": 0, "file_names": []},
                 )
             return self._sessions[session_id]
 
@@ -46,7 +47,7 @@ class SessionManager:
                     document_ids=[],
                     created_at=now,
                     last_activity=now,
-                    metadata={"document_count": 0},
+                    metadata={"document_count": 0, "file_names": []},
                 )
                 self._sessions[session_id] = session
             if doc_id not in session.document_ids:
@@ -139,3 +140,25 @@ class SessionManager:
                 return {}
             pending = session.metadata.get("pending_tracks") or {}
             return dict(pending)
+
+    async def add_file_name(self, session_id: str, file_name: str) -> None:
+        """Track a file name associated with the session."""
+        sanitized = normalize_file_name(file_name)
+        if not sanitized:
+            return
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if not session:
+                return
+            file_names = session.metadata.setdefault("file_names", [])
+            if sanitized not in file_names:
+                file_names.append(sanitized)
+
+    async def get_file_names(self, session_id: str) -> List[str]:
+        """Return known file names for the session."""
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if not session:
+                return []
+            file_names = session.metadata.get("file_names") or []
+            return list(file_names)

@@ -163,3 +163,55 @@ async def test_upload_pending_placeholder(monkeypatch):
     finally:
         settings.upload_status_timeout = original_timeout
         settings.upload_status_background_timeout = original_background_timeout
+
+
+@pytest.mark.asyncio
+async def test_query_matches_by_file_name():
+    base_url = settings.lightrag_url.rstrip("/")
+
+    async with AsyncClient(app=app, base_url="http://testserver") as client:
+        with respx.mock(assert_all_called=False) as mock:
+            mock.post(f"{base_url}/documents/upload").respond(
+                200,
+                json={"document_ids": ["doc-file"]},
+            )
+            mock.post(f"{base_url}/query/data").respond(
+                200,
+                json={
+                    "status": "success",
+                    "data": {
+                        "chunks": [
+                            {
+                                "content": "Key findings",
+                                "file_path": "ANNUAL SUMMARY 2024.PDF",
+                                "source_id": "chunk-001",
+                                "chunk_id": "chunk-001",
+                            }
+                        ],
+                        "references": [],
+                        "entities": [],
+                        "relationships": [],
+                    },
+                    "metadata": {
+                        "processing_info": {"final_chunks_count": 1}
+                    },
+                },
+            )
+
+            response = await client.post(
+                "/session/file-session/upload",
+                files={
+                    "file": ("Reports/Annual Summary 2024.PDF", b"content", "application/pdf")
+                },
+            )
+            assert response.status_code == 201
+
+            query_response = await client.post(
+                "/session/file-session/query",
+                json={"query": "Summarize the annual report", "mode": "mix"},
+            )
+            assert query_response.status_code == 200
+            data = query_response.json()
+            assert data["filtered_data"]["data"]["chunks"][0]["content"] == "Key findings"
+
+        await session_manager.delete_session("file-session")

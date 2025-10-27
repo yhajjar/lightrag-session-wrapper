@@ -33,6 +33,7 @@ from .models import (
     UploadResponse,
 )
 from .session_manager import SessionManager
+from .utils import normalize_file_name
 
 logger = logging.getLogger("lightrag_session_wrapper")
 logging.basicConfig(level=settings.log_level.upper())
@@ -178,10 +179,21 @@ def _compose_answer(chunks: List[Dict[str, Any]], query_text: str) -> str:
     return f"Based on documents in this session:\n\n{merged}"
 
 
-async def _fetch_document_ids_for_track(
+async def _register_file_names(session_id: str, *file_names: str) -> None:
+    """Store normalized file names for session filtering."""
+    unique = {
+        name
+        for name in (normalize_file_name(value) for value in file_names)
+        if name
+    }
+    for name in unique:
+        await session_manager.add_file_name(session_id, name)
+
+
+async def _fetch_documents_for_track(
     track_id: str, *, timeout: float, interval: float
-) -> List[str]:
-    """Attempt to resolve document ids associated with a LightRAG track id."""
+) -> List[Dict[str, Any]]:
+    """Attempt to resolve documents associated with a LightRAG track id."""
     if timeout < 0:
         timeout = 0.0
     if interval <= 0:
@@ -207,20 +219,31 @@ async def _fetch_document_ids_for_track(
                 return []
         else:
             documents = payload.get("documents") or []
-            doc_ids = [str(doc.get("id")) for doc in documents if doc.get("id")]
-            statuses = {
-                str(doc.get("status", "")).lower()
-                for doc in documents
-                if doc.get("status") is not None
-            }
-            if doc_ids:
+            resolved = []
+            statuses = set()
+            for doc in documents:
+                doc_id = doc.get("id")
+                status_value = doc.get("status")
+                if status_value is not None:
+                    statuses.add(str(status_value).lower())
+                if doc_id:
+                    resolved.append(
+                        {
+                            "id": str(doc_id),
+                            "file_path": doc.get("file_path")
+                            or (doc.get("metadata") or {}).get("file_path"),
+                            "status": status_value,
+                            "metadata": doc.get("metadata") or {},
+                        }
+                    )
+            if resolved:
                 logger.info(
                     "Resolved track %s to document ids %s on attempt %d",
                     track_id,
-                    doc_ids,
+                    [rec["id"] for rec in resolved],
                     attempt,
                 )
-                return doc_ids
+                return resolved
             if statuses and statuses.issubset({"failed", "error"}):
                 logger.warning(
                     "Track %s reached terminal failure states: %s", track_id, statuses
@@ -246,12 +269,23 @@ def _schedule_track_resolution(session_id: str, placeholder_id: str, track_id: s
 
     async def _runner() -> None:
         try:
-            doc_ids = await _fetch_document_ids_for_track(
+            records = await _fetch_documents_for_track(
                 track_id,
                 timeout=settings.upload_status_background_timeout,
                 interval=settings.upload_status_poll_interval,
             )
-            if doc_ids:
+            if records:
+                for record in records:
+                    metadata = record.get("metadata") or {}
+                    await _register_file_names(
+                        session_id,
+                        record.get("file_path"),
+                        metadata.get("file_name"),
+                        metadata.get("original_file_name"),
+                        metadata.get("source_file"),
+                        metadata.get("source_path"),
+                    )
+                doc_ids = [record["id"] for record in records if record.get("id")]
                 await session_manager.resolve_pending_track(
                     session_id, placeholder_id, doc_ids
                 )
@@ -278,7 +312,7 @@ async def _resolve_pending_tracks(session_id: str, *, timeout: float) -> None:
         return
     for placeholder_id, track_id in pending.items():
         try:
-            doc_ids = await _fetch_document_ids_for_track(
+            records = await _fetch_documents_for_track(
                 track_id,
                 timeout=timeout,
                 interval=settings.upload_status_poll_interval,
@@ -290,7 +324,18 @@ async def _resolve_pending_tracks(session_id: str, *, timeout: float) -> None:
                 session_id,
             )
             continue
-        if doc_ids:
+        if records:
+            for record in records:
+                metadata = record.get("metadata") or {}
+                await _register_file_names(
+                    session_id,
+                    record.get("file_path"),
+                    metadata.get("file_name"),
+                    metadata.get("original_file_name"),
+                    metadata.get("source_file"),
+                    metadata.get("source_path"),
+                )
+            doc_ids = [record["id"] for record in records if record.get("id")]
             await session_manager.resolve_pending_track(
                 session_id, placeholder_id, doc_ids
             )
@@ -327,6 +372,8 @@ async def upload_document(
     if user_agent:
         session.metadata["user_agent"] = user_agent
 
+    await _register_file_names(session_id, file.filename)
+
     try:
         client = _get_lightrag_client()
         lightrag_response = await client.upload_document(
@@ -344,15 +391,16 @@ async def upload_document(
     document_ids = _extract_document_ids(lightrag_response)
     track_id = lightrag_response.get("track_id")
     pending = False
+    track_records: List[Dict[str, Any]] = []
 
     if not document_ids and track_id:
-        doc_ids_from_track = await _fetch_document_ids_for_track(
+        track_records = await _fetch_documents_for_track(
             track_id,
             timeout=settings.upload_status_timeout,
             interval=settings.upload_status_poll_interval,
         )
-        if doc_ids_from_track:
-            document_ids = doc_ids_from_track
+        if track_records:
+            document_ids = [record["id"] for record in track_records if record.get("id")]
 
     if not document_ids:
         if track_id:
@@ -377,6 +425,18 @@ async def upload_document(
 
     for doc_id in document_ids:
         await session_manager.add_document(session_id, doc_id)
+
+    if track_records:
+        for record in track_records:
+            metadata = record.get("metadata") or {}
+            await _register_file_names(
+                session_id,
+                record.get("file_path"),
+                metadata.get("file_name"),
+                metadata.get("original_file_name"),
+                metadata.get("source_file"),
+                metadata.get("source_path"),
+            )
 
     message = lightrag_response.get("message")
     if not message:
@@ -427,7 +487,8 @@ async def query_session(
             detail="Unable to query LightRAG",
         ) from exc
 
-    filtered = filter_by_session(rag_response, session.document_ids)
+    file_names = session.metadata.get("file_names", [])
+    filtered = filter_by_session(rag_response, session.document_ids, file_names)
     data_section = filtered.get("data") or {}
     chunks = data_section.get("chunks") or []
 
