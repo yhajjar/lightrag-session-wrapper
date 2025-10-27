@@ -1,6 +1,6 @@
 import pytest
 import respx
-from httpx import AsyncClient, Response
+from httpx import AsyncClient
 
 from app.config import settings
 from app.main import app, session_manager
@@ -34,6 +34,10 @@ async def test_session_flow():
                     },
                 },
             )
+            mock.post(f"{base_url}/query").respond(
+                200,
+                json={"response": "LLM summarised answer"},
+            )
             mock.delete(f"{base_url}/documents/doc-xyz789").respond(204)
 
             response = await client.post(
@@ -57,7 +61,7 @@ async def test_session_flow():
             )
             assert query_response.status_code == 200
             query_payload = query_response.json()
-            assert "Based on documents" in query_payload["response"]
+            assert query_payload["response"] == "LLM summarised answer"
             assert query_payload["references"][0]["source_id"] == "doc-xyz789"
 
             delete_response = await client.delete("/session/test-session")
@@ -197,6 +201,10 @@ async def test_query_matches_by_file_name():
                     },
                 },
             )
+            mock.post(f"{base_url}/query").respond(
+                200,
+                json={"response": "User-focused summary"},
+            )
 
             response = await client.post(
                 "/session/file-session/upload",
@@ -212,6 +220,7 @@ async def test_query_matches_by_file_name():
             )
             assert query_response.status_code == 200
             data = query_response.json()
+            assert data["response"] == "User-focused summary"
             assert data["filtered_data"]["data"]["chunks"][0]["content"] == "Key findings"
 
         await session_manager.delete_session("file-session")

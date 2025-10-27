@@ -10,6 +10,7 @@ Stateless FastAPI service that adds session-aware isolation on top of the LightR
 - Docker image ready for docker-compose deployment
 - Upload endpoint handles asynchronous LightRAG processing via `track_id` polling and exposes a `pending` flag when documents are still indexing
 - Session queries match LightRAG UI behaviour by tracking sanitized document filenames alongside ids
+- Query responses now reuse LightRAG’s LLM via bypass mode after session filtering, so answers mirror native `/query` output without cross-session leakage
 
 ## Configuration
 Set the following environment variables as needed:
@@ -47,3 +48,4 @@ The FastAPI application exposes an OpenAPI schema at `/docs` and `/openapi.json`
 - If LightRAG responds with a `track_id` but no `document_ids`, the wrapper returns `status="processing"`, includes the `track_id`, and sets `pending=true` while polling LightRAG for completion.
 - A placeholder `document_id` prefixed with `track:` is returned until indexing completes; background tasks resolve it automatically and subsequent queries/deletes prefer the resolved id.
 - Document filenames are normalized and tracked so query filtering accepts LightRAG chunk responses that reference file paths instead of document ids.
+- After filtering, the wrapper calls LightRAG’s bypass mode to generate a polished answer from the permitted context, avoiding leakage while keeping narrative responses.

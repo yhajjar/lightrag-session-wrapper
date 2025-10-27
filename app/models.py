@@ -23,6 +23,12 @@ class QueryRequest(BaseModel):
     mode: str = "mix"
     include_references: bool = True
     top_k: int = 10
+    response_type: Optional[str] = None
+    stream: Optional[bool] = None
+    hl_keywords: Optional[List[str]] = None
+    ll_keywords: Optional[List[str]] = None
+    conversation_history: Optional[List[Dict[str, Any]]] = None
+    user_prompt: Optional[str] = None
 
 
 class Reference(BaseModel):

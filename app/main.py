@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import httpx
 from fastapi import (
@@ -132,12 +132,20 @@ def _build_references(filtered_payload: Dict[str, Any]) -> List[Reference]:
     raw_refs = data.get("references")
     if isinstance(raw_refs, list) and raw_refs:
         for idx, ref in enumerate(raw_refs, start=1):
+            metadata = {
+                k: v
+                for k, v in ref.items()
+                if k not in ("reference_id", "file_path", "source_id")
+            }
+            original_reference_id = ref.get("reference_id")
+            if original_reference_id is not None:
+                metadata.setdefault("original_reference_id", original_reference_id)
             references.append(
                 Reference(
-                    reference_id=str(ref.get("reference_id", idx)),
+                    reference_id=str(idx),
                     file_path=ref.get("file_path"),
                     source_id=ref.get("source_id"),
-                    metadata={k: v for k, v in ref.items() if k not in ("reference_id", "file_path", "source_id")},
+                    metadata=metadata,
                 )
             )
     else:
@@ -341,6 +349,127 @@ async def _resolve_pending_tracks(session_id: str, *, timeout: float) -> None:
             )
 
 
+def _build_reference_lookup(references: List[Reference]) -> Dict[str, str]:
+    lookup: Dict[str, str] = {}
+    for reference in references:
+        display_id = reference.reference_id
+        if display_id:
+            lookup[str(display_id)] = display_id
+        original_id = reference.metadata.get("original_reference_id")
+        if original_id is not None:
+            lookup[str(original_id)] = display_id
+    return lookup
+
+
+def _select_context_chunks(
+    filtered_payload: Dict[str, Any],
+    max_chunks: int = 6,
+    max_chars: int = 8000,
+) -> List[Tuple[Dict[str, Any], str]]:
+    data = filtered_payload.get("data") or {}
+    chunks = data.get("chunks") or []
+    selected: List[Tuple[Dict[str, Any], str]] = []
+    total_chars = 0
+
+    for chunk in chunks:
+        content = (chunk.get("content") or "").strip()
+        if not content:
+            continue
+        selected.append((chunk, content))
+        total_chars += len(content)
+        if len(selected) >= max_chunks or total_chars >= max_chars:
+            break
+
+    return selected
+
+
+def _build_context_text(
+    chunks: List[Tuple[Dict[str, Any], str]], reference_lookup: Dict[str, str]
+) -> str:
+    lines: List[str] = []
+    for chunk, content in chunks:
+        reference_id = chunk.get("reference_id")
+        label = ""
+        if reference_id is not None:
+            mapped = reference_lookup.get(str(reference_id))
+            if mapped:
+                label = f"[{mapped}] "
+        if label or content:
+            lines.append(f"{label}{content}")
+    return "\n\n".join(lines).strip()
+
+
+def _format_reference_section(references: List[Reference]) -> str:
+    lines: List[str] = []
+    for reference in references:
+        label = reference.reference_id or ""
+        descriptor = reference.file_path or reference.source_id or "Document"
+        lines.append(f"[{label}] {descriptor}")
+    return "\n".join(lines).strip()
+
+
+async def _generate_llm_summary(
+    query_request: QueryRequest,
+    filtered_payload: Dict[str, Any],
+    references: List[Reference],
+) -> str | None:
+    reference_lookup = _build_reference_lookup(references)
+    context_chunks = _select_context_chunks(filtered_payload)
+    if not context_chunks:
+        return None
+
+    context_text = _build_context_text(context_chunks, reference_lookup)
+    if not context_text:
+        return None
+
+    reference_section = _format_reference_section(references)
+
+    prompt_parts = [
+        "You are a helpful assistant that answers questions using only the provided context.",
+        "If the context does not contain the answer, reply with: Context does not contain relevant information.",
+        "Cite supporting statements using bracketed reference numbers like [1] that correspond to the reference list.",
+        "",
+        "Context:",
+        context_text,
+    ]
+    if reference_section:
+        prompt_parts.extend(["", "Reference list:", reference_section])
+    prompt_parts.extend(
+        [
+            "",
+            f"Question: {query_request.query}",
+            "",
+            "Answer:",
+        ]
+    )
+
+    payload: Dict[str, Any] = {
+        "query": "\n".join(prompt_parts),
+        "mode": "bypass",
+        "include_references": False,
+        "response_type": query_request.response_type or "Multiple Paragraphs",
+        "stream": False,
+    }
+
+    if query_request.top_k is not None:
+        payload["top_k"] = query_request.top_k
+
+    if query_request.conversation_history:
+        payload["conversation_history"] = query_request.conversation_history
+
+    try:
+        client = _get_lightrag_client()
+        llm_response = await client.query(payload)
+    except httpx.HTTPError:
+        logger.exception("LightRAG bypass summarisation failed")
+        return None
+
+    answer = llm_response.get("response")
+    if isinstance(answer, str) and answer.strip():
+        return answer.strip()
+    return None
+
+
 def _get_lightrag_client() -> LightRagClient:
     if lightrag_client is None:
         raise RuntimeError("LightRAG client not initialised")
@@ -492,8 +621,10 @@ async def query_session(
     data_section = filtered.get("data") or {}
     chunks = data_section.get("chunks") or []
 
-    response_text = _compose_answer(chunks, query.query)
     references = _build_references(filtered)
+    response_text = await _generate_llm_summary(query, filtered, references)
+    if response_text is None:
+        response_text = _compose_answer(chunks, query.query)
 
     logger.info(
         "Session %s query='%s' doc_count=%d filtered_chunks=%d",
