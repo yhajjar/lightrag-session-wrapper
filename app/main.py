@@ -358,6 +358,9 @@ def _build_reference_lookup(references: List[Reference]) -> Dict[str, str]:
         original_id = reference.metadata.get("original_reference_id")
         if original_id is not None:
             lookup[str(original_id)] = display_id
+        normalized_file = normalize_file_name(reference.file_path)
+        if normalized_file:
+            lookup[normalized_file] = display_id
     return lookup
 
 
@@ -388,10 +391,15 @@ def _build_context_text(
 ) -> str:
     lines: List[str] = []
     for chunk, content in chunks:
-        reference_id = chunk.get("reference_id")
         label = ""
+        reference_id = chunk.get("reference_id")
         if reference_id is not None:
             mapped = reference_lookup.get(str(reference_id))
+            if mapped:
+                label = f"[{mapped}] "
+        if not label:
+            normalized = normalize_file_name(chunk.get("file_path"))
+            mapped = reference_lookup.get(normalized) if normalized else None
             if mapped:
                 label = f"[{mapped}] "
         if label or content:
@@ -414,6 +422,7 @@ async def _generate_llm_summary(
     references: List[Reference],
 ) -> str | None:
     reference_lookup = _build_reference_lookup(references)
+    data_section = filtered_payload.get("data") or {}
     context_chunks = _select_context_chunks(filtered_payload)
     if not context_chunks:
         return None
@@ -424,13 +433,57 @@ async def _generate_llm_summary(
 
     reference_section = _format_reference_section(references)
 
+    entities = data_section.get("entities") or []
+    relationships = data_section.get("relationships") or []
+    entity_lines: List[str] = []
+    reference_by_file = {
+        normalize_file_name(ref.file_path): ref.reference_id for ref in references
+    }
+    for entity in entities[:12]:
+        name = entity.get("entity_name")
+        description = entity.get("description") or ""
+        label = ""
+        normalized = normalize_file_name(entity.get("file_path"))
+        if normalized:
+            ref_id = reference_by_file.get(normalized)
+            if ref_id:
+                label = f"[{ref_id}] "
+        entity_lines.append(f"{label}{name}: {description}".strip())
+
+    relationship_lines: List[str] = []
+    for relation in relationships[:12]:
+        src = relation.get("src_id")
+        tgt = relation.get("tgt_id")
+        description = relation.get("description") or ""
+        label = ""
+        normalized = normalize_file_name(relation.get("file_path"))
+        if normalized:
+            ref_id = reference_by_file.get(normalized)
+            if ref_id:
+                label = f"[{ref_id}] "
+        relationship_lines.append(
+            f"{label}{src} → {tgt}: {description}".strip()
+        )
+
+    context_sections: List[str] = []
+    if entity_lines:
+        context_sections.append("Entities:\n" + "\n".join(entity_lines))
+    if relationship_lines:
+        context_sections.append("Relationships:\n" + "\n".join(relationship_lines))
+    context_sections.append("Chunks:\n" + context_text)
+    combined_context = "\n\n".join(section for section in context_sections if section).strip()
+
+    if not combined_context:
+        return None
+
     prompt_parts = [
         "You are a helpful assistant that answers questions using only the provided context.",
-        "If the context does not contain the answer, reply with: Context does not contain relevant information.",
+        "Use the information to craft a concise, well-structured response to the question.",
         "Cite supporting statements using bracketed reference numbers like [1] that correspond to the reference list.",
+        "If the context truly lacks relevant information, reply exactly with: Context does not contain relevant information.",
         "",
         "Context:",
-        context_text,
+        combined_context,
     ]
     if reference_section:
         prompt_parts.extend(["", "Reference list:", reference_section])
