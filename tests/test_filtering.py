@@ -70,3 +70,71 @@ def test_filter_matches_on_file_name_only():
 
     filtered = filter_by_session(rag_response, [], ["report.pdf"])
     assert len(filtered["data"]["chunks"]) == 1
+
+
+def test_filter_uses_metadata_doc_id():
+    rag_response = {
+        "status": "success",
+        "data": {
+            "chunks": [
+                {
+                    "content": "Meta chunk",
+                    "chunk_id": "chunk-5",
+                    "metadata": {"document_id": "doc-xyz789"},
+                }
+            ],
+            "entities": [],
+            "relationships": [],
+            "references": [],
+        },
+    }
+
+    filtered = filter_by_session(rag_response, ["doc-xyz789"])
+    assert len(filtered["data"]["chunks"]) == 1
+
+
+def test_filter_checks_reference_mapping():
+    rag_response = {
+        "status": "success",
+        "data": {
+            "chunks": [
+                {
+                    "content": "Context",
+                    "chunk_id": "chunk-1",
+                    "reference_id": "ref-1",
+                }
+            ],
+            "references": [
+                {
+                    "reference_id": "ref-1",
+                    "file_path": "summary.docx",
+                }
+            ],
+            "entities": [],
+            "relationships": [],
+        },
+    }
+
+    filtered = filter_by_session(rag_response, [], ["summary.docx"])
+    assert len(filtered["data"]["chunks"]) == 1
+
+
+def test_filter_fallback_when_no_matches():
+    rag_response = {
+        "status": "success",
+        "data": {
+            "chunks": [
+                {
+                    "content": "Other session chunk",
+                    "file_path": "other.pdf",
+                }
+            ],
+            "entities": [],
+            "relationships": [],
+            "references": [],
+        },
+    }
+
+    filtered = filter_by_session(rag_response, ["doc-xyz789"], ["doc_xyz789.pdf"])
+    # Since filtering removes everything, fallback should keep original data
+    assert filtered["data"]["chunks"]
