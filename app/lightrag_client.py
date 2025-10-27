@@ -52,3 +52,8 @@ class LightRagClient:
         response = await self._client.get("/health")
         response.raise_for_status()
         return response.json()
+
+    async def get_track_status(self, track_id: str) -> Dict[str, Any]:
+        response = await self._client.get(f"/documents/track_status/{track_id}")
+        response.raise_for_status()
+        return response.json()

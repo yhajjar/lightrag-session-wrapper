@@ -8,6 +8,7 @@ Stateless FastAPI service that adds session-aware isolation on top of the LightR
 - Background cleanup of expired sessions based on configurable TTL
 - LightRAG query filtering to prevent cross-session leakage
 - Docker image ready for docker-compose deployment
+- Upload endpoint handles asynchronous LightRAG processing via `track_id` polling and exposes a `pending` flag when documents are still indexing
 
 ## Configuration
 Set the following environment variables as needed:
@@ -19,6 +20,9 @@ WRAPPER_PORT=8000
 SESSION_MAX_AGE_HOURS=24
 SESSION_CLEANUP_INTERVAL=3600
 CORS_ORIGINS=*
+UPLOAD_STATUS_TIMEOUT=15
+UPLOAD_STATUS_POLL_INTERVAL=2
+UPLOAD_STATUS_BACKGROUND_TIMEOUT=180
 ```
 
 ## Local Development
@@ -37,3 +41,7 @@ pytest
 ```
 
 The FastAPI application exposes an OpenAPI schema at `/docs` and `/openapi.json` when running locally.
+
+## Upload Behaviour
+- If LightRAG responds with a `track_id` but no `document_ids`, the wrapper returns `status="processing"`, includes the `track_id`, and sets `pending=true` while polling LightRAG for completion.
+- A placeholder `document_id` prefixed with `track:` is returned until indexing completes; background tasks resolve it automatically and subsequent queries/deletes prefer the resolved id.

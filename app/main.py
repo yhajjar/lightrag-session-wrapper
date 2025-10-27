@@ -178,6 +178,124 @@ def _compose_answer(chunks: List[Dict[str, Any]], query_text: str) -> str:
     return f"Based on documents in this session:\n\n{merged}"
 
 
+async def _fetch_document_ids_for_track(
+    track_id: str, *, timeout: float, interval: float
+) -> List[str]:
+    """Attempt to resolve document ids associated with a LightRAG track id."""
+    if timeout < 0:
+        timeout = 0.0
+    if interval <= 0:
+        interval = 1.0
+
+    client = _get_lightrag_client()
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    attempt = 0
+
+    while True:
+        attempt += 1
+        try:
+            payload = await client.get_track_status(track_id)
+        except httpx.HTTPError as exc:
+            logger.warning(
+                "Failed to fetch track status for %s on attempt %d: %s",
+                track_id,
+                attempt,
+                exc,
+            )
+            if timeout == 0:
+                return []
+        else:
+            documents = payload.get("documents") or []
+            doc_ids = [str(doc.get("id")) for doc in documents if doc.get("id")]
+            statuses = {
+                str(doc.get("status", "")).lower()
+                for doc in documents
+                if doc.get("status") is not None
+            }
+            if doc_ids:
+                logger.info(
+                    "Resolved track %s to document ids %s on attempt %d",
+                    track_id,
+                    doc_ids,
+                    attempt,
+                )
+                return doc_ids
+            if statuses and statuses.issubset({"failed", "error"}):
+                logger.warning(
+                    "Track %s reached terminal failure states: %s", track_id, statuses
+                )
+                return []
+
+        if timeout == 0:
+            return []
+
+        now = loop.time()
+        if now >= deadline:
+            logger.info(
+                "Timeout while waiting for track %s to produce document ids", track_id
+            )
+            return []
+
+        sleep_for = min(interval, max(0.1, deadline - now))
+        await asyncio.sleep(sleep_for)
+
+
+def _schedule_track_resolution(session_id: str, placeholder_id: str, track_id: str) -> None:
+    """Fire-and-forget background task to resolve pending track ids."""
+
+    async def _runner() -> None:
+        try:
+            doc_ids = await _fetch_document_ids_for_track(
+                track_id,
+                timeout=settings.upload_status_background_timeout,
+                interval=settings.upload_status_poll_interval,
+            )
+            if doc_ids:
+                await session_manager.resolve_pending_track(
+                    session_id, placeholder_id, doc_ids
+                )
+                logger.info(
+                    "Background resolved track %s for session %s to %s",
+                    track_id,
+                    session_id,
+                    doc_ids,
+                )
+        except Exception:
+            logger.exception(
+                "Unexpected error while resolving track %s for session %s",
+                track_id,
+                session_id,
+            )
+
+    asyncio.create_task(_runner())
+
+
+async def _resolve_pending_tracks(session_id: str, *, timeout: float) -> None:
+    """Refresh placeholder document ids for a session, if possible."""
+    pending = await session_manager.get_pending_tracks(session_id)
+    if not pending:
+        return
+    for placeholder_id, track_id in pending.items():
+        try:
+            doc_ids = await _fetch_document_ids_for_track(
+                track_id,
+                timeout=timeout,
+                interval=settings.upload_status_poll_interval,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to resolve pending track %s for session %s",
+                track_id,
+                session_id,
+            )
+            continue
+        if doc_ids:
+            await session_manager.resolve_pending_track(
+                session_id, placeholder_id, doc_ids
+            )
+
+
 def _get_lightrag_client() -> LightRagClient:
     if lightrag_client is None:
         raise RuntimeError("LightRAG client not initialised")
@@ -224,22 +342,59 @@ async def upload_document(
         ) from exc
 
     document_ids = _extract_document_ids(lightrag_response)
-    if not document_ids:
-        logger.warning("LightRAG upload response missing document ids: %s", lightrag_response)
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="LightRAG did not return document identifiers",
+    track_id = lightrag_response.get("track_id")
+    pending = False
+
+    if not document_ids and track_id:
+        doc_ids_from_track = await _fetch_document_ids_for_track(
+            track_id,
+            timeout=settings.upload_status_timeout,
+            interval=settings.upload_status_poll_interval,
         )
+        if doc_ids_from_track:
+            document_ids = doc_ids_from_track
+
+    if not document_ids:
+        if track_id:
+            pending = True
+            placeholder_id = f"track:{track_id}"
+            document_ids = [placeholder_id]
+            await session_manager.mark_pending_track(session_id, placeholder_id, track_id)
+            _schedule_track_resolution(session_id, placeholder_id, track_id)
+            logger.info(
+                "Tracking pending document for session %s via track_id %s",
+                session_id,
+                track_id,
+            )
+        else:
+            logger.warning(
+                "LightRAG upload response missing document ids: %s", lightrag_response
+            )
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="LightRAG did not return document identifiers",
+            )
 
     for doc_id in document_ids:
         await session_manager.add_document(session_id, doc_id)
 
-    message = f"{len(document_ids)} documents uploaded successfully"
+    message = lightrag_response.get("message")
+    if not message:
+        if pending:
+            message = "File accepted for background processing."
+        else:
+            count = len(document_ids)
+            plural = "document" if count == 1 else "documents"
+            message = f"{count} {plural} uploaded successfully"
+
+    status_text = "success" if not pending else "processing"
     return UploadResponse(
-        status="success",
+        status=status_text,
         session_id=session_id,
         document_ids=document_ids,
         message=message,
+        track_id=track_id,
+        pending=pending,
     )
 
 
@@ -253,6 +408,14 @@ async def query_session(
     query: QueryRequest,
     session: SessionData = Depends(get_existing_session),
 ):
+    await _resolve_pending_tracks(session_id, timeout=0.0)
+    refreshed_session = await session_manager.get_session(session_id)
+    if refreshed_session is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Session '{session_id}' not found",
+        )
+    session = refreshed_session
     payload = query.model_dump()
     try:
         client = _get_lightrag_client()
@@ -298,6 +461,14 @@ async def list_session_documents(
     session_id: str,
     session: SessionData = Depends(get_existing_session),
 ):
+    await _resolve_pending_tracks(session_id, timeout=0.0)
+    refreshed_session = await session_manager.get_session(session_id)
+    if refreshed_session is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Session '{session_id}' not found",
+        )
+    session = refreshed_session
     await session_manager.update_activity(session_id)
     return SessionDocumentsResponse(
         session_id=session_id,
@@ -315,9 +486,29 @@ async def delete_session(
     session_id: str,
     session: SessionData = Depends(get_existing_session),
 ):
+    await _resolve_pending_tracks(
+        session_id, timeout=settings.upload_status_poll_interval
+    )
+    refreshed_session = await session_manager.get_session(session_id)
+    if refreshed_session is None:
+        return DeleteSessionResponse(
+            status="session deleted",
+            session_id=session_id,
+            deleted_count=0,
+            error_count=0,
+        )
+    session = refreshed_session
     deleted_count = 0
     error_count = 0
     for doc_id in session.document_ids:
+        if doc_id.startswith("track:"):
+            logger.warning(
+                "Cannot delete pending LightRAG document %s for session %s",
+                doc_id,
+                session_id,
+            )
+            error_count += 1
+            continue
         try:
             client = _get_lightrag_client()
             success = await client.delete_document(doc_id)

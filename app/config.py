@@ -19,6 +19,15 @@ class Settings(BaseSettings):
     workers: int = Field(default=2, alias="WORKERS")
     log_level: str = Field(default="info", alias="LOG_LEVEL")
     cors_origins: str = Field(default="*", alias="CORS_ORIGINS")
+    upload_status_timeout: float = Field(
+        default=15.0, alias="UPLOAD_STATUS_TIMEOUT"
+    )
+    upload_status_poll_interval: float = Field(
+        default=2.0, alias="UPLOAD_STATUS_POLL_INTERVAL"
+    )
+    upload_status_background_timeout: float = Field(
+        default=180.0, alias="UPLOAD_STATUS_BACKGROUND_TIMEOUT"
+    )
 
     model_config = SettingsConfigDict(
         env_file=".env",

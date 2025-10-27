@@ -96,3 +96,46 @@ class SessionManager:
         """Return a list of active session ids."""
         async with self._lock:
             return list(self._sessions.keys())
+
+    async def mark_pending_track(
+        self, session_id: str, placeholder_id: str, track_id: str
+    ) -> None:
+        """Record a pending track id placeholder for later resolution."""
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if not session:
+                return
+            pending = session.metadata.setdefault("pending_tracks", {})
+            pending[placeholder_id] = track_id
+
+    async def resolve_pending_track(
+        self, session_id: str, placeholder_id: str, doc_ids: List[str]
+    ) -> None:
+        """Replace a placeholder document with resolved document ids."""
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if not session:
+                return
+            changed = False
+            if placeholder_id in session.document_ids:
+                session.document_ids.remove(placeholder_id)
+                changed = True
+            pending = session.metadata.get("pending_tracks")
+            if isinstance(pending, dict):
+                pending.pop(placeholder_id, None)
+            for doc_id in doc_ids:
+                if doc_id and doc_id not in session.document_ids:
+                    session.document_ids.append(doc_id)
+                    changed = True
+            if changed:
+                session.metadata["document_count"] = len(session.document_ids)
+                session.last_activity = utcnow()
+
+    async def get_pending_tracks(self, session_id: str) -> Dict[str, str]:
+        """Return mapping of placeholder ids to track ids for the session."""
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if not session:
+                return {}
+            pending = session.metadata.get("pending_tracks") or {}
+            return dict(pending)

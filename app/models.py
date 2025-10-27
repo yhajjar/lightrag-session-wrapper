@@ -45,6 +45,8 @@ class UploadResponse(BaseModel):
     session_id: str
     document_ids: List[str]
     message: str
+    track_id: Optional[str] = None
+    pending: bool = False
 
 
 class SessionDocumentsResponse(BaseModel):

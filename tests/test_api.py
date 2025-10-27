@@ -3,7 +3,7 @@ import respx
 from httpx import AsyncClient, Response
 
 from app.config import settings
-from app.main import app
+from app.main import app, session_manager
 
 
 @pytest.mark.asyncio
@@ -43,6 +43,8 @@ async def test_session_flow():
             assert response.status_code == 201
             payload = response.json()
             assert payload["document_ids"] == ["doc-xyz789"]
+            assert payload["pending"] is False
+            assert payload["track_id"] is None
 
             docs_response = await client.get("/session/test-session/documents")
             assert docs_response.status_code == 200
@@ -78,5 +80,86 @@ async def test_health_endpoint_handles_lightrag_failure():
             response = await client.get("/health")
             assert response.status_code == 200
             payload = response.json()
-            assert payload["status"] == "degraded"
-            assert payload["lightrag_status"] == "error"
+        assert payload["status"] == "degraded"
+        assert payload["lightrag_status"] == "error"
+
+
+@pytest.mark.asyncio
+async def test_upload_resolves_track_id(monkeypatch):
+    base_url = settings.lightrag_url.rstrip("/")
+    track_id = "upload_123"
+
+    async with AsyncClient(app=app, base_url="http://testserver") as client:
+        with respx.mock(assert_all_called=False) as mock:
+            mock.post(f"{base_url}/documents/upload").respond(
+                200,
+                json={
+                    "status": "success",
+                    "message": "Processing in background.",
+                    "track_id": track_id,
+                },
+            )
+            mock.get(f"{base_url}/documents/track_status/{track_id}").respond(
+                200,
+                json={
+                    "track_id": track_id,
+                    "documents": [
+                        {"id": "doc-processed", "status": "completed"}
+                    ],
+                    "total_count": 1,
+                },
+            )
+
+            response = await client.post(
+                "/session/track-session/upload",
+                files={"file": ("doc2.pdf", b"hello world", "application/pdf")},
+            )
+            assert response.status_code == 201
+            payload = response.json()
+            assert payload["document_ids"] == ["doc-processed"]
+            assert payload["track_id"] == track_id
+            assert payload["pending"] is False
+            assert payload["status"] == "success"
+        await session_manager.delete_session("track-session")
+
+
+@pytest.mark.asyncio
+async def test_upload_pending_placeholder(monkeypatch):
+    base_url = settings.lightrag_url.rstrip("/")
+    track_id = "upload_pending"
+
+    original_timeout = settings.upload_status_timeout
+    original_background_timeout = settings.upload_status_background_timeout
+    try:
+        settings.upload_status_timeout = 0
+        settings.upload_status_background_timeout = 0
+
+        async with AsyncClient(app=app, base_url="http://testserver") as client:
+            with respx.mock(assert_all_called=False) as mock:
+                mock.post(f"{base_url}/documents/upload").respond(
+                    200,
+                    json={
+                        "status": "success",
+                        "message": "Processing in background.",
+                        "track_id": track_id,
+                    },
+                )
+                mock.get(f"{base_url}/documents/track_status/{track_id}").respond(
+                    200,
+                    json={"track_id": track_id, "documents": [], "total_count": 0},
+                )
+
+                response = await client.post(
+                    "/session/pending-session/upload",
+                    files={"file": ("doc3.pdf", b"hello world", "application/pdf")},
+                )
+                assert response.status_code == 201
+                payload = response.json()
+                assert payload["pending"] is True
+                assert payload["track_id"] == track_id
+                assert payload["document_ids"][0].startswith("track:")
+                assert payload["status"] == "processing"
+        await session_manager.delete_session("pending-session")
+    finally:
+        settings.upload_status_timeout = original_timeout
+        settings.upload_status_background_timeout = original_background_timeout
