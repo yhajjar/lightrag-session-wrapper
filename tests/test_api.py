@@ -170,6 +170,37 @@ async def test_upload_pending_placeholder(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_upload_duplicate_returns_conflict():
+    base_url = settings.lightrag_url.rstrip("/")
+    duplicate_message = (
+        "File 'hyderation.pdf' already exists in document storage (Status: DocStatus.PROCESSED)."
+    )
+
+    async with AsyncClient(app=app, base_url="http://testserver") as client:
+        with respx.mock(assert_all_called=False) as mock:
+            mock.post(f"{base_url}/documents/upload").respond(
+                200,
+                json={
+                    "status": "duplicated",
+                    "message": duplicate_message,
+                    "track_id": "",
+                },
+            )
+
+            response = await client.post(
+                "/session/duplicate-session/upload",
+                files={"file": ("hyderation.pdf", b"data", "application/pdf")},
+            )
+
+            assert response.status_code == 409
+            payload = response.json()
+            assert payload["detail"]["message"] == duplicate_message
+            assert payload["detail"]["lightrag_status"] == "duplicated"
+
+        await session_manager.delete_session("duplicate-session")
+
+
+@pytest.mark.asyncio
 async def test_query_matches_by_file_name():
     base_url = settings.lightrag_url.rstrip("/")
 

@@ -600,9 +600,28 @@ async def upload_document(
             logger.warning(
                 "LightRAG upload response missing document ids: %s", lightrag_response
             )
+            lightrag_status = lightrag_response.get("status")
+            error_message = (
+                lightrag_response.get("message")
+                or "LightRAG did not return document identifiers"
+            )
+            status_code = (
+                status.HTTP_409_CONFLICT
+                if isinstance(lightrag_status, str)
+                and lightrag_status.lower() in {"duplicate", "duplicated"}
+                else status.HTTP_502_BAD_GATEWAY
+            )
+            detail: Any
+            if lightrag_status:
+                detail = {
+                    "message": error_message,
+                    "lightrag_status": lightrag_status,
+                }
+            else:
+                detail = error_message
             raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail="LightRAG did not return document identifiers",
+                status_code=status_code,
+                detail=detail,
             )
 
     for doc_id in document_ids:
